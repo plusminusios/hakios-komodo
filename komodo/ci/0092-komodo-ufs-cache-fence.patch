@@ -1,0 +1,116 @@
+komodo: UFS cache coherency on by default + optional Tensor fence lifts
+
+The Exynos UFS host is not cache-coherent (the driver already cleans/invalidates
+the DMA region around every command), but that maintenance was gated behind
+ufscache=1 which defaulted OFF. With a cacheable kmem_alloc_contig buffer the
+UTRD/UCD the CPU wrote stayed in cache and the controller fetched stale DRAM, so
+every command sat in the doorbell with OCS 0xf / IS 0. Default ufscache ON.
+
+Also add two optional, boot-arg-gated pokes for the Tensor G4 fences that can
+block the controller's DRAM access entirely, ported from Linux ufs-exynos.c:
+  ufsmode bit6 (0x40): sysreg_ufs IO-coherency (ufs-iocc, [0x710] |= 3)
+  ufsmode bit5 (0x20): open the FMP/SMU protector (exynos_ufs_config_smu)
+Both default off; the default path is unchanged except for the cache fix.
+
+--- a/bsd/dev/tegu_ufs.c	2026-11-02 01:53:01.882321500 +0100
++++ b/bsd/dev/tegu_ufs.c	2026-11-02 01:53:58.678025829 +0100
+@@ -169,6 +169,25 @@
+ #define UIC_DME_HIBER_EXIT      0x18
+ #define VS_IOP_ACG_DISABLE      0x100
+ 
++/*
++ * komodo (Tensor G4) fencing: the Exynos UFS AXI master can only reach DRAM
++ * the bootloader/EL3 allowed (sysreg IO-coherency) and, for data, the FMP/SMU
++ * protector must be open or the controller never completes a transfer (OCS
++ * 0xf). Both regions come from the device tree (reg[3] ufsp @ 0x132a0000 and
++ * samsung,sysreg-phandle sysreg_ufs @ 0x13020000); hard-coded here because the
++ * stock tegu driver only maps the HCI reg range. Gated behind ufsmode bits so
++ * the default path is untouched. Offsets per Linux drivers/ufs/host/ufs-exynos.c.
++ */
++#define KOMO_UFSP_PA            0x132a0000ull   /* UFS protector (FMP/SMU)  */
++#define KOMO_SYSREG_UFS_PA      0x13020000ull   /* sysreg_ufs               */
++#define UFSPRSECURITY           0x010
++#define UFSP_NSSMU              (1u << 14)
++#define UFSPSBEGIN0             0x200
++#define UFSPSEND0               0x204
++#define UFSPSLUN0               0x208
++#define UFSPSCTRL0             0x20c
++#define SYSREG_UFS_IOCC         0x710           /* ufs-iocc: mask 3, val 3  */
++
+ static inline uint32_t
+ vs_rd(uint32_t off)
+ {
+@@ -480,6 +499,47 @@
+ 	return ENOENT;
+ }
+ 
++/*
++ * komodo: lift the Tensor fences before ringing a doorbell.
++ *   ufsmode bit6 (0x40) - set IO-coherency for the UFS AXI master in sysreg_ufs
++ *                         so the controller's reads of our DRAM are allowed.
++ *   ufsmode bit5 (0x20) - open the FMP/SMU protector (Linux exynos_ufs_config_smu):
++ *                         NSSMU + whole-LBA bypass region, so transfers complete.
++ * Both are read-modify-write pokes to Device MMIO; harmless if the bit is clear.
++ */
++static void
++ufs_komodo_unfence(void)
++{
++	if (su.mode & 0x40) {
++		vm_offset_t sr = ml_io_map(KOMO_SYSREG_UFS_PA, 0x1000);
++		if (sr) {
++			volatile uint32_t *r = (volatile uint32_t *)(sr + SYSREG_UFS_IOCC);
++			uint32_t v = *r;
++			*r = (v & ~3u) | 3u;
++			__builtin_arm_dsb(0xf);
++			printf("TEGU UFS: iocc sysreg[0x710] 0x%x -> 0x%x\n", v, *r);
++		} else {
++			printf("TEGU UFS: iocc sysreg map failed\n");
++		}
++	}
++	if (su.mode & 0x20) {
++		vm_offset_t p = ml_io_map(KOMO_UFSP_PA, 0x1000);
++		if (p) {
++			volatile uint32_t *sec = (volatile uint32_t *)(p + UFSPRSECURITY);
++			uint32_t old = *sec;
++			*sec = old | UFSP_NSSMU;
++			*(volatile uint32_t *)(p + UFSPSBEGIN0) = 0;
++			*(volatile uint32_t *)(p + UFSPSEND0)   = 0xffffffffu;
++			*(volatile uint32_t *)(p + UFSPSLUN0)   = 0xffu;
++			*(volatile uint32_t *)(p + UFSPSCTRL0)  = 0xf1u;
++			__builtin_arm_dsb(0xf);
++			printf("TEGU UFS: FMP/SMU open: SECURITY 0x%x -> 0x%x\n", old, *sec);
++		} else {
++			printf("TEGU UFS: FMP/SMU map failed\n");
++		}
++	}
++}
++
+ static int
+ ufs_take_over_host(void)
+ {
+@@ -728,10 +788,15 @@
+ 	PE_parse_boot_argn("ufsroot", want, sizeof(want));
+ 	uint32_t rw = 0;
+ 	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
+-	uint32_t cache = 0, wait = 0;
++	/* komodo: default ON. The Exynos host is not cache-coherent (see the
++	 * clean/invalidate around every command); the UTRD/UCD the CPU writes
++	 * must be pushed to DRAM before the doorbell or the host fetches stale
++	 * cache-line contents and the command sits with OCS 0xf, IS 0. Set
++	 * ufscache=0 to go back to the old (no-maintenance) behaviour. */
++	uint32_t cache = 1, wait = 0;
+ 	PE_parse_boot_argn("ufscache", &cache, sizeof(cache));
+ 	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));
+-	su.cache = (cache == 1);
++	su.cache = (cache != 0);
+ 	su.wait = (wait == 1);
+ 	uint32_t exynos = 1, prdt = 16;
+ 	PE_parse_boot_argn("ufsexynos", &exynos, sizeof(exynos));
+@@ -783,6 +848,7 @@
+ 			printf("TEGU UFS: using ABL's DMA area 0x%llx-0x%llx\n", pa, pa + DMA_SIZE);
+ 		}
+ 	}
++	ufs_komodo_unfence();
+ 	if (su.vs && (su.mode & 8)) {
+ 		ufs_exynos_wake();
+ 	}

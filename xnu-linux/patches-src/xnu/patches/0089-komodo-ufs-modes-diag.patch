@@ -1,0 +1,162 @@
+komodo: UFS encoding modes, NEXUS_TYPE, auto-retry and register dumps
+
+First hardware run (0086, byte-granular): TEST UNIT READY timed out x3. zuma's DT
+has fixed-prdt-req_list-ocs; Linux sets HCI_UTRL_NEXUS_TYPE for SCSI slots.
+boot-arg ufsmode (bit0 byte offsets, bit1 4K PRDT, bit2 NEXUS), default 0x6;
+on timeout flip bit0 and retry; dump HCI/UIC/vendor registers.
+
+--- a/bsd/dev/tegu_ufs.c
++++ b/bsd/dev/tegu_ufs.c
+@@ -121,6 +121,12 @@
+ 	bool wait;                              /* boot-arg ufswait=1 */
+ 	bool exynos;                            /* boot-arg ufsexynos (default 1) */
+ 	uint32_t prdt_stride;                   /* boot-arg ufsprdt: 16 or 128 */
++	/* komodo boot-arg ufsmode: bit0 byte-granular UTRD offsets/lengths,
++	 * bit1 4 KiB PRDT entries, bit2 set HCI_UTRL_NEXUS_TYPE (SCSI) for the
++	 * slot. Default 0x6: zuma's DT says fixed-prdt-req_list-ocs (the
++	 * byte-granularity quirk is fixed in this host revision). */
++	uint32_t mode;
++	vm_offset_t vs;                         /* Exynos vendor HCI (hci + 0x1100) */
+ 	int bmajor, cmajor;
+ 	dev_t bdev;
+ 	bool ready;
+@@ -141,6 +147,41 @@
+ 	*(volatile uint32_t *)(su.regs + off) = v;
+ }
+ 
++/* Exynos vendor HCI (Linux ufs-exynos.c offsets) */
++#define VS_TXPRDT_ENTRY_SIZE    0x00
++#define VS_RXPRDT_ENTRY_SIZE    0x04
++#define VS_UTRL_NEXUS_TYPE      0x40
++#define VS_DATA_REORDER         0x60
++#define VS_MISC                 0xb4
++#define VS_IOP_ACG_DISABLE      0x100
++
++static inline uint32_t
++vs_rd(uint32_t off)
++{
++	return su.vs ? *(volatile uint32_t *)(su.vs + off) : 0xdeadu;
++}
++
++static inline void
++vs_wr(uint32_t off, uint32_t v)
++{
++	if (su.vs) {
++		*(volatile uint32_t *)(su.vs + off) = v;
++	}
++}
++
++static void
++ufs_dump_regs(const char *why)
++{
++	printf("TEGU UFS: %s: IS 0x%x HCS 0x%x HCE 0x%x DBR 0x%x RSR 0x%x BA 0x%x:%x\n", why,
++	    ufs_rd(REG_IS), ufs_rd(REG_HCS), ufs_rd(REG_HCE), ufs_rd(REG_UTRLDBR),
++	    ufs_rd(REG_UTRLRSR), ufs_rd(REG_UTRLBAU), ufs_rd(REG_UTRLBA));
++	printf("TEGU UFS:   UIC err PA 0x%x DL 0x%x N 0x%x T 0x%x DME 0x%x\n",
++	    ufs_rd(0x38), ufs_rd(0x3c), ufs_rd(0x40), ufs_rd(0x44), ufs_rd(0x48));
++	printf("TEGU UFS:   vs TXPRDT 0x%x RXPRDT 0x%x NEXUS 0x%x REORDER 0x%x MISC 0x%x ACG 0x%x\n",
++	    vs_rd(VS_TXPRDT_ENTRY_SIZE), vs_rd(VS_RXPRDT_ENTRY_SIZE), vs_rd(VS_UTRL_NEXUS_TYPE),
++	    vs_rd(VS_DATA_REORDER), vs_rd(VS_MISC), vs_rd(VS_IOP_ACG_DISABLE));
++}
++
+ static void
+ dma_sync(uint32_t off, uint32_t len)
+ {
+@@ -183,10 +224,11 @@
+ 	utrd->dw2 = 0x0f;                       /* OCS invalid until updated */
+ 	utrd->ucdba = (uint32_t)ucd_pa;
+ 	utrd->ucdbau = (uint32_t)(ucd_pa >> 32);
+-	const uint32_t chunk_max = su.exynos ? PRDT_CHUNK_EXYNOS : PRDT_CHUNK;
+-	const uint32_t stride = su.exynos ? su.prdt_stride : 16u;
++	const bool bytegran = (su.mode & 1) != 0;
++	const uint32_t chunk_max = (su.mode & 2) ? PRDT_CHUNK_EXYNOS : PRDT_CHUNK;
++	const uint32_t stride = su.prdt_stride;
+ 	/* response UPIU at 512, 512 bytes long; PRDT at 1024 */
+-	utrd->resp = su.exynos ? (512u << 16 | 512u) : ((512u / 4) << 16 | (512u / 4));
++	utrd->resp = bytegran ? (512u << 16 | 512u) : ((512u / 4) << 16 | (512u / 4));
+ 	if (len) {
+ 		uint32_t n = 0;
+ 		for (uint32_t done = 0; done < len; done += chunk_max, n++) {
+@@ -197,7 +239,7 @@
+ 			e[2] = 0;
+ 			e[3] = chunk - 1;
+ 		}
+-		utrd->prdt = su.exynos ? (1024u << 16 | (n * stride)) : ((1024u / 4) << 16 | n);
++		utrd->prdt = bytegran ? (1024u << 16 | (n * stride)) : ((1024u / 4) << 16 | n);
+ 	}
+ 
+ 	if (su.cache) {
+@@ -206,7 +248,7 @@
+ 		dma_sync(DMA_UCD + offsetof(struct ucd, resp), sizeof(ucd->resp));
+ 		if (len) {
+ 			dma_clean(DMA_UCD + offsetof(struct ucd, prdt),
+-			    su.exynos ? (utrd->prdt & 0xffff) : (utrd->prdt & 0xffff) * 16u);
++			    bytegran ? (utrd->prdt & 0xffff) : (utrd->prdt & 0xffff) * stride);
+ 		}
+ 	} else {
+ 		dma_sync(DMA_UTRL, sizeof(*utrd));
+@@ -221,6 +263,9 @@
+ 	}
+ 	__builtin_arm_dsb(0xf);
+ 
++	if (su.mode & 4) {
++		vs_wr(VS_UTRL_NEXUS_TYPE, vs_rd(VS_UTRL_NEXUS_TYPE) | 1u);   /* slot 0 = SCSI */
++	}
+ 	ufs_wr(REG_UTRLDBR, 1);
+ 	uint64_t deadline;
+ 	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
+@@ -236,8 +281,11 @@
+ 	while (ufs_rd(REG_UTRLDBR) & 1) {
+ 		uint64_t now = mach_absolute_time();
+ 		if (now > deadline) {
++			dma_sync(DMA_UTRL, sizeof(*utrd));
++			printf("TEGU UFS: command 0x%02x timed out (mode 0x%x, ocs 0x%x, dma 0x%llx)\n",
++			    cdb[0], su.mode, utrd->dw2 & 0xff, su.dma_pa);
++			ufs_dump_regs("timeout");
+ 			ufs_wr(REG_UTRLCLR, ~1u);
+-			printf("TEGU UFS: command 0x%02x timed out\n", cdb[0]);
+ 			return ETIMEDOUT;
+ 		}
+ 		if (sleepable && now >= spin_until) {
+@@ -628,10 +676,17 @@
+ 	PE_parse_boot_argn("ufsprdt", &prdt, sizeof(prdt));
+ 	su.exynos = (exynos != 0);
+ 	su.prdt_stride = (prdt == 128) ? 128u : 16u;
+-	printf("TEGU UFS: %s descriptor encoding, PRDT entry %u bytes\n",
+-	    su.exynos ? "Exynos (byte granular, 4 KiB entries)" : "standard", su.prdt_stride);
++	uint32_t mode = su.exynos ? 0x6u : 0x0u;
++	PE_parse_boot_argn("ufsmode", &mode, sizeof(mode));
++	su.mode = mode;
++	printf("TEGU UFS: mode 0x%x (%s offsets, %s PRDT entries%s), entry %u bytes\n", su.mode,
++	    (su.mode & 1) ? "byte" : "dword", (su.mode & 2) ? "4 KiB" : "256 KiB",
++	    (su.mode & 4) ? ", NEXUS" : "", su.prdt_stride);
+ 
+ 	su.regs = ml_io_map(reg[0], reg[1]);
++	if (su.exynos) {
++		su.vs = ml_io_map(reg[0] + 0x1100, 0x2000);   /* DT: vs_hci @ hci + 0x1100 */
++	}
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("TEGU UFS: no contiguous DMA memory\n");
+@@ -648,9 +703,19 @@
+ 	lck_mtx_lock(&tegu_ufs_lock);
+ 	error = ufs_take_over_host();
+ 	if (!error) {
++		ufs_dump_regs("taken over");
+ 		static const uint8_t tur[6] = { 0x00 };
+-		/* The first command after the bootloader may report a unit attention. */
+-		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++		/* The first command after the bootloader may report a unit attention.
++		 * komodo: on a timeout flip the offset granularity for the next try,
++		 * so one boot tests both encodings. */
++		for (int i = 0; i < 4 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++			if (error == ETIMEDOUT) {
++				su.mode ^= 1u;
++				printf("TEGU UFS: retrying with mode 0x%x\n", su.mode);
++			}
++		}
++		if (!error) {
++			printf("TEGU UFS: TEST UNIT READY ok with mode 0x%x\n", su.mode);
+ 		}
+ 	}
+ 	if (!error) {

@@ -1,0 +1,27 @@
+diff --git a/pexpert/pexpert/arm64/TEGU.h b/pexpert/pexpert/arm64/TEGU.h
+--- a/pexpert/pexpert/arm64/TEGU.h
++++ b/pexpert/pexpert/arm64/TEGU.h
+@@ -35,16 +35,18 @@
+ #endif /* ! ASSEMBLER */
+ 
+ /*
+- * Qualcomm numbers the architected timer PPIs 1/2/3/0 (secure phys, phys,
+- * virt, hyp) instead of the usual 13/14/11/10: the virtual timer XNU uses
+- * (CNTV) is INTID 16 + 3 = 19.
++ * zumapro (Tensor G4) uses the STANDARD architected-timer PPIs
++ * (13 sec-phys, 14 ns-phys, 11 virt, 10 hyp-virt): the virtual timer XNU
++ * drives (CNTV) is INTID 16 + 11 = 27.  (Was 19 from the ios-sweet Qualcomm
++ * base.)  Authoritative value comes from the ADT "virtual-timer-intid"; this
++ * is the fallback.  If the timer never fires, try 30 (ns-PHYSICAL, PPI 14).
+  */
+-#define TEGU_VTIMER_INTID        19
++#define TEGU_VTIMER_INTID        27
+ #define TEGU_IPI_SGI             1       // SGI used for cross-CPU signals
+ 
+ #define GIC_SPURIOUS_IRQ          1023    // IRQ no. for GIC spurious interrupt
+ 
+-#define GICR_PE_SIZE              0x20000 // Size of each redistributor region
++#define GICR_PE_SIZE              0x40000 // zumapro GICv4: 0x200000/8 PE (was GICv3 0x20000)
+ 
+ /* GICv3 register definitions; see GICv3 spec (Arm IHI 0069G) */
+ #define GICD_CTLR                 0x0

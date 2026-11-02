@@ -1,0 +1,38 @@
+komodo: tolerate zero typed kalloc_type views (Linux / stock clang build)
+
+Without Apple clang's __builtin_xnu_type_signature the compat header makes every
+type data-only, so kalloc_type_view_parse() returns 0 fixed/var views; the
+iterator builders then assert (seen on komodo: kalloc.c:1264 c_idx == p_idx).
+
+--- a/osfmk/kern/kalloc.c
++++ b/osfmk/kern/kalloc.c
+@@ -1784,6 +1784,17 @@
+ 	 */
+ 	kt_count = kalloc_type_view_parse(KTV_FIXED);
+ 	assert(kt_count < KALLOC_TYPE_SIZE_MASK);
++	if (kt_count == 0) {
++		/*
++		 * komodo (kernel built on Linux with stock clang): there is no
++		 * __builtin_xnu_type_signature, the compat header marks every type
++		 * data-only, so every fixed view was already given a data heap zone
++		 * by kalloc_type_view_copy(). Nothing is left to segregate; the
++		 * iterator code below asserts on an empty list.
++		 */
++		printf("kalloc_type: no typed fixed views (stock-clang build), all on the data heap\n");
++		return;
++	}
+ 
+ #if DEBUG || DEVELOPMENT
+ 	vm_size_t sig_slist_size = (size_t) kt_count * sizeof(uint16_t);
+@@ -1904,6 +1915,11 @@
+ 	 */
+ 	kt_count = kalloc_type_view_parse(KTV_VAR);
+ 	assert(kt_count < UINT32_MAX);
++	if (kt_count == 0) {
++		/* komodo: see kalloc_type_view_init_fixed (stock clang, all data) */
++		printf("kalloc_type: no typed var views (stock-clang build), all on the data heap\n");
++		return;
++	}
+ 
+ #if DEBUG || DEVELOPMENT
+ 	vm_size_t sig_slist_size = (size_t) kt_count * sizeof(uint32_t);

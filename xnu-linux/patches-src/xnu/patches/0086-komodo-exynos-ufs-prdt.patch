@@ -1,0 +1,110 @@
+komodo: Exynos UFS host descriptor encoding for tegu_ufs
+
+Tensor G4 has a Samsung Exynos UFS host. Linux ufs-exynos (gs101) uses
+UFSHCD_QUIRK_PRDT_BYTE_GRAN and 4 KiB PRDT entries (HCI_{TX,RX}PRDT_ENTRY_SIZE=12);
+128-byte entries with FMP. tegu encodes for a standard (Qualcomm) host: DWORD
+offsets and 256 KiB entries, which the Exynos host would misread.
+Default on; ufsexynos=0 restores tegu, ufsprdt=128 selects FMP-size entries.
+
+--- a/bsd/dev/tegu_ufs.c
++++ b/bsd/dev/tegu_ufs.c
+@@ -72,7 +72,17 @@
+ #define UFS_BLOCK       4096u
+ #define BOUNCE_SIZE     (1u << 20)
+ #define PRDT_CHUNK      (256u << 10)            /* PRDT byte count field: 18 bits */
+-#define PRDT_MAX        (BOUNCE_SIZE / PRDT_CHUNK)
++/*
++ * komodo (Tensor G4, Samsung Exynos UFS host): Linux ufs-exynos (gs101/zuma)
++ * runs this host with UFSHCD_QUIRK_PRDT_BYTE_GRAN (UTRD offsets/lengths and
++ * the PRDT length are in BYTES, not DWORDs) and programs
++ * HCI_{TX,RX}PRDT_ENTRY_SIZE = 12, so one PRDT entry moves at most 4 KiB.
++ * With FMP inline crypto the entries are 128 bytes instead of 16.
++ * boot-args: ufsexynos=0 (back to the tegu/Qualcomm encoding), ufsprdt=128.
++ */
++#define PRDT_CHUNK_EXYNOS 4096u
++#define PRDT_MAX        (BOUNCE_SIZE / PRDT_CHUNK_EXYNOS)
++#define PRDT_STRIDE_MAX 128u
+ #define CMD_TIMEOUT_NS  (5ull * NSEC_PER_SEC)
+ #define CMD_SPIN_NS     (50ull * NSEC_PER_USEC)
+ #define CMD_SLEEP_NS    (200ull * NSEC_PER_USEC)
+@@ -87,15 +97,15 @@
+ struct ucd {
+ 	uint8_t cmd[512];
+ 	uint8_t resp[512];
+-	struct {
+-		uint32_t addr_lo, addr_hi, rsvd, dbc;
+-	} prdt[PRDT_MAX];
++	/* entries of 16 (standard) or 128 (Exynos FMP) bytes:
++	 * { addr_lo, addr_hi, rsvd, dbc } then FMP key words */
++	uint8_t prdt[PRDT_MAX * PRDT_STRIDE_MAX];
+ };
+ 
+ /* Layout of the contiguous DMA allocation. */
+ #define DMA_UTRL        0x0000                  /* 1 KiB aligned */
+ #define DMA_UCD         0x1000                  /* 128 byte aligned */
+-#define DMA_BOUNCE      0x4000
++#define DMA_BOUNCE      0x10000                 /* after UCD 0x1000 + 1 KiB + 256 x 128 B */
+ #define DMA_SIZE        (DMA_BOUNCE + BOUNCE_SIZE)
+ 
+ static struct {
+@@ -109,6 +119,8 @@
+ 	bool writable;                          /* boot-arg ufsrw=1 */
+ 	bool cache;                             /* boot-arg ufscache=1 */
+ 	bool wait;                              /* boot-arg ufswait=1 */
++	bool exynos;                            /* boot-arg ufsexynos (default 1) */
++	uint32_t prdt_stride;                   /* boot-arg ufsprdt: 16 or 128 */
+ 	int bmajor, cmajor;
+ 	dev_t bdev;
+ 	bool ready;
+@@ -171,16 +183,21 @@
+ 	utrd->dw2 = 0x0f;                       /* OCS invalid until updated */
+ 	utrd->ucdba = (uint32_t)ucd_pa;
+ 	utrd->ucdbau = (uint32_t)(ucd_pa >> 32);
+-	utrd->resp = (512u / 4) << 16 | (512u / 4);
++	const uint32_t chunk_max = su.exynos ? PRDT_CHUNK_EXYNOS : PRDT_CHUNK;
++	const uint32_t stride = su.exynos ? su.prdt_stride : 16u;
++	/* response UPIU at 512, 512 bytes long; PRDT at 1024 */
++	utrd->resp = su.exynos ? (512u << 16 | 512u) : ((512u / 4) << 16 | (512u / 4));
+ 	if (len) {
+ 		uint32_t n = 0;
+-		for (uint32_t done = 0; done < len; done += PRDT_CHUNK, n++) {
+-			uint32_t chunk = MIN(PRDT_CHUNK, len - done);
+-			ucd->prdt[n].addr_lo = (uint32_t)(bounce_pa + done);
+-			ucd->prdt[n].addr_hi = (uint32_t)((bounce_pa + done) >> 32);
+-			ucd->prdt[n].dbc = chunk - 1;
++		for (uint32_t done = 0; done < len; done += chunk_max, n++) {
++			uint32_t chunk = MIN(chunk_max, len - done);
++			uint32_t *e = (uint32_t *)(void *)(ucd->prdt + n * stride);
++			e[0] = (uint32_t)(bounce_pa + done);
++			e[1] = (uint32_t)((bounce_pa + done) >> 32);
++			e[2] = 0;
++			e[3] = chunk - 1;
+ 		}
+-		utrd->prdt = (1024u / 4) << 16 | n;
++		utrd->prdt = su.exynos ? (1024u << 16 | (n * stride)) : ((1024u / 4) << 16 | n);
+ 	}
+ 
+ 	if (su.cache) {
+@@ -189,7 +206,7 @@
+ 		dma_sync(DMA_UCD + offsetof(struct ucd, resp), sizeof(ucd->resp));
+ 		if (len) {
+ 			dma_clean(DMA_UCD + offsetof(struct ucd, prdt),
+-			    (utrd->prdt & 0xffff) * sizeof(ucd->prdt[0]));
++			    su.exynos ? (utrd->prdt & 0xffff) : (utrd->prdt & 0xffff) * 16u);
+ 		}
+ 	} else {
+ 		dma_sync(DMA_UTRL, sizeof(*utrd));
+@@ -606,6 +623,13 @@
+ 	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));
+ 	su.cache = (cache == 1);
+ 	su.wait = (wait == 1);
++	uint32_t exynos = 1, prdt = 16;
++	PE_parse_boot_argn("ufsexynos", &exynos, sizeof(exynos));
++	PE_parse_boot_argn("ufsprdt", &prdt, sizeof(prdt));
++	su.exynos = (exynos != 0);
++	su.prdt_stride = (prdt == 128) ? 128u : 16u;
++	printf("TEGU UFS: %s descriptor encoding, PRDT entry %u bytes\n",
++	    su.exynos ? "Exynos (byte granular, 4 KiB entries)" : "standard", su.prdt_stride);
+ 
+ 	su.regs = ml_io_map(reg[0], reg[1]);
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,

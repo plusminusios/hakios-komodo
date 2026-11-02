@@ -1,0 +1,58 @@
+name: shim
+
+# M2: build the tegu boot shim and wrap it in a boot image v4 mirroring the
+# stock CP3A.260905.009 header (page 4096, os_version 17.0.0 / 2026-09).
+# Linux runner: free, no macOS minutes. The boot image is TEGU-TODO(#3)
+# until tegu ABL accepts it on hardware.
+on:
+  push:
+    paths:
+      - "shim/**"
+      - "tools/mkbootimg.py"
+      - ".github/workflows/shim.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: shim-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install aarch64 cross-toolchain
+        run: sudo apt-get update -q && sudo apt-get install -y -q gcc-aarch64-linux-gnu
+
+      - name: Build shim + boot image v4
+        run: bash shim/build.sh
+
+      - name: Validate boot image header against stock
+        run: |
+          python3 - <<'EOF'
+          import struct
+          b = open('shim/out/shim-boot.img','rb').read(4096)
+          assert b[:8] == b'ANDROID!', 'bad magic'
+          hv, = struct.unpack_from('<I', b, 40)
+          assert hv == 4, f'header version {hv}'
+          ks, rs, osv, hs = struct.unpack_from('<IIII', b, 8)
+          # stock CP3A.260905.009: header_size 1584, os_version 0x220001a9
+          assert hs == 1584, f'header_size {hs}'
+          assert osv == 0x220001a9, f'os_version {osv:#x}'
+          img = len(open('shim/out/Image','rb').read())
+          assert ks == img, f'kernel_size {ks} != image {img}'
+          assert rs > 0, 'no ramdisk'
+          print(f'boot image v4 OK: kernel {ks}, ramdisk {rs}, osv {osv:#x}')
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shim-boot-tegu
+          path: |
+            shim/out/shim-boot.img
+            shim/out/Image
+          if-no-files-found: error

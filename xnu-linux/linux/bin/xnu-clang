@@ -1,0 +1,20 @@
+#!/bin/bash
+# clang wrapper for cross-building XNU on Linux: forces an Apple Mach-O target
+# (stock Linux clang defaults to ELF), links with the cctools ld64 from theos, and drops
+# the flags only Apple's own clang knows. Stock clang is fine as the compiler; it is the
+# linker, nm and strip that must understand Mach-O.
+HB=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+TOPDIR=$(cd "$HB/.." && pwd)
+case "$(basename "$0")" in *++) drv=clang++; extra=(-fno-use-cxa-atexit);; *) drv=clang; extra=();; esac
+args=()
+for a in "$@"; do
+  case "$a" in
+    -enable-trivial-auto-var-init-zero-knowing-it-will-be-removed-from-clang) ;;
+    -fapple-kext-vtable-verify|-Wno-vla-cxx-extension) ;;
+    -Werror|-Werror=*|-Weverything|-pedantic-errors) ;;
+    *) args+=("$a");;
+  esac
+done
+exec "${LLVM_BIN:-/usr/bin}/$drv" -include "$TOPDIR/hostinc/xnu_clang_compat.h" \
+  -target "arm64-apple-macos${XNU_SDK_VERSION:-13.3}" --ld-path="$HB/ld64" \
+  -w "${extra[@]}" "${args[@]}"

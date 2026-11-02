@@ -1,0 +1,53 @@
+komodo: UFS descriptors in the bootloader's DMA area (ufsmode bit4)
+
+0090 result: clocks were not stopped (CLKSTOP 0), HIBER_EXIT -> UPMCRS 5 (link was
+not in H8); TUR still never fetched (OCS 0xf, IS 0) with DMA below or above 4 GiB.
+Test whether DMA is fenced to ABL's buffers: reuse ABL's UTRLBA page (ABL kept it
+at 0xf8d35000, inside abl@f8800000). Mapped write-combine (Device memory faults
+on bzero). Wake off.
+--- a/bsd/dev/tegu_ufs.c
++++ b/bsd/dev/tegu_ufs.c
+@@ -43,6 +43,7 @@
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+ /* osfmk/arm/cpu_data.h, not exported to the BSD layer */
+ extern int get_preemption_level(void);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+@@ -737,7 +738,7 @@
+ 	PE_parse_boot_argn("ufsprdt", &prdt, sizeof(prdt));
+ 	su.exynos = (exynos != 0);
+ 	su.prdt_stride = (prdt == 128) ? 128u : 16u;
+-	uint32_t mode = su.exynos ? 0xeu : 0x0u;   /* + bit3: wake (ungate, hibern8 exit) */
++	uint32_t mode = su.exynos ? 0x16u : 0x0u;  /* bit4: ABL DMA area; bit3 wake off (UPMCRS 5) */
+ 	PE_parse_boot_argn("ufsmode", &mode, sizeof(mode));
+ 	su.mode = mode;
+ 	printf("TEGU UFS: mode 0x%x (%s offsets, %s PRDT entries%s), entry %u bytes\n", su.mode,
+@@ -762,6 +763,26 @@
+ 	su.secsize = DEV_BSIZE;
+ 
+ 	lck_mtx_lock(&tegu_ufs_lock);
++	uint64_t abl_utrl = ((uint64_t)ufs_rd(REG_UTRLBAU) << 32) | ufs_rd(REG_UTRLBA);
++	printf("TEGU UFS: ABL request list at 0x%llx (task list 0x%x:%x)\n", abl_utrl,
++	    ufs_rd(0x74), ufs_rd(0x70));
++	/*
++	 * komodo, ufsmode bit4: put our descriptors/bounce buffer where ABL kept
++	 * its own request list. Every TUR with our own DMA memory (below and
++	 * above 4 GiB) stayed in the doorbell with OCS 0xf: the host's DMA is
++	 * most likely fenced (Tensor S2MPU) to the bootloader's buffers.
++	 */
++	if ((su.mode & 16) && abl_utrl) {
++		uint64_t pa = abl_utrl & ~0xfffull;
++		/* Normal non-cacheable: bzero/memcpy need unaligned access (Device faults) */
++		vm_offset_t va = ml_io_map_wcomb(pa, DMA_SIZE);
++		if (va) {
++			bzero((void *)va, DMA_SIZE);
++			su.dma = va;
++			su.dma_pa = pa;
++			printf("TEGU UFS: using ABL's DMA area 0x%llx-0x%llx\n", pa, pa + DMA_SIZE);
++		}
++	}
+ 	if (su.vs && (su.mode & 8)) {
+ 		ufs_exynos_wake();
+ 	}

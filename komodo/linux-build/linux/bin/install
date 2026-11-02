@@ -1,0 +1,4 @@
+#!/bin/bash
+# BSD-style install wrapper: XNU's makefiles pass -S (safe copy), which GNU install lacks.
+args=(); for a in "$@"; do [ "$a" = "-S" ] || args+=("$a"); done
+exec /usr/bin/install "${args[@]}"

@@ -1,0 +1,3 @@
+#!/bin/sh
+# no-op codesign: the kernel is not signed on this path
+exit 0

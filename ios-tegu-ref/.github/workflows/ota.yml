@@ -1,0 +1,50 @@
+name: ota
+on:
+  workflow_dispatch:
+
+jobs:
+  fetch:
+    # Extracts the stock tegu boot images + DTBs for build CP3A.260905.009 so
+    # the owner never needs a Linux PC. Artifacts: boot.img, vendor_boot.img,
+    # dtbo.img, vendor_kernel_boot.img, init_boot.img + dumped DTBs.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          curl -sL -o pdgo.tar.gz \
+            https://github.com/ssut/payload-dumper-go/releases/download/2.1.0/payload-dumper-go_2.1.0_linux_amd64.tar.gz
+          tar xf pdgo.tar.gz && sudo mv payload-dumper-go /usr/local/bin/
+
+      - name: Fetch OTA and extract boot images
+        run: bash tools/ota-fetch.sh --workdir ota
+
+      - name: Dump DTBs
+        run: |
+          python3 tools/unpack_bootv4.py ota/boot.img ota/vendor_boot.img ota/dtbo.img dtb/
+          # the full base DTBs are raw FDT blobs inside vendor_kernel_boot
+          python3 - <<'EOF'
+          import struct, glob, os
+          os.makedirs("dtb", exist_ok=True)
+          data = open("ota/vendor_kernel_boot.img","rb").read()
+          off = 0; n = 0
+          while True:
+              off = data.find(b"\xd0\x0d\xfe\xed", off)
+              if off < 0: break
+              ts = struct.unpack_from(">I", data, off+4)[0]
+              if 0 < ts <= len(data)-off:
+                  open(f"dtb/vendor_kernel_boot-{n:02d}.dtb","wb").write(data[off:off+ts])
+                  n += 1; off += ts
+              else:
+                  off += 4
+          print(n, "base DTBs dumped")
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tegu-stock-cp3a
+          path: |
+            ota/*.img
+            dtb/
+          if-no-files-found: error

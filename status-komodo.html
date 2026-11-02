@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HackiOS → Pixel 9 Pro XL (komodo) — статус порта</title>
+<style>
+:root{--bg:#0b0e13;--panel:#131821;--line:#222b38;--tx:#d7dee8;--mut:#8591a3;
+--grn:#35d07f;--red:#ff5c5c;--yel:#ffcf5c;--acc:#6ea8fe;--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;-webkit-text-size-adjust:100%}
+.wrap{max-width:860px;margin:0 auto;padding:22px 16px 80px}
+header{border-bottom:1px solid var(--line);padding-bottom:18px;margin-bottom:8px}
+h1{font-size:22px;margin:0 0 6px;line-height:1.25}
+.sub{color:var(--mut);font-size:14px}
+.tags{margin-top:12px;display:flex;flex-wrap:wrap;gap:8px}
+.tag{font:12px/1 var(--mono);padding:6px 9px;border-radius:999px;border:1px solid var(--line);background:var(--panel);color:var(--mut)}
+h2{font-size:17px;margin:30px 0 12px;display:flex;align-items:center;gap:9px}
+h2 .dot{width:9px;height:9px;border-radius:50%;flex:none}
+.ok .dot{background:var(--grn)} .blk .dot{background:var(--red)} .no .dot{background:var(--yel)} .info .dot{background:var(--acc)}
+ul{margin:0;padding-left:20px} li{margin:7px 0}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin:10px 0}
+b.g{color:var(--grn)} b.r{color:var(--red)} b.y{color:var(--yel)} b.a{color:var(--acc)}
+code{font-family:var(--mono);font-size:13px;background:#1b2230;border:1px solid var(--line);padding:1px 5px;border-radius:5px;color:#cfe0ff}
+pre{font-family:var(--mono);font-size:12.5px;line-height:1.5;background:#0e131b;border:1px solid var(--line);border-radius:10px;padding:13px;overflow:auto;color:#c6d2e2}
+.mut{color:var(--mut)} .small{font-size:13px}
+footer{margin-top:40px;border-top:1px solid var(--line);padding-top:14px;color:var(--mut);font-size:12.5px}
+a{color:var(--acc)}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+<h1>HackiOS / Darwin XNU&nbsp;→&nbsp;Pixel 9 Pro XL</h1>
+<div class="sub">Порт ядра Apple XNU/Darwin (iOS 16, xnu-8796.141.3) на физический Pixel 9 Pro XL &middot; codename <b>komodo</b> &middot; board zumapro &middot; SoC <b>Google Tensor G4</b></div>
+<div class="tags">
+<span class="tag">RAM-only (fastboot boot)</span>
+<span class="tag">Android не тронут</span>
+<span class="tag">база: ios-tegu / ios-sweet</span>
+<span class="tag">обратная связь: фото экрана</span>
+</div>
+</header>
+
+<p class="small mut">Всё тестируется только в оперативке через <code>fastboot boot</code> — ничего не прошивается. UART/debug-кабеля нет; единственный канал отладки от железа — фото framebuffer-консоли.</p>
+
+<h2 class="ok"><span class="dot"></span>Что уже работает (проверено на железе)</h2>
+<ul>
+<li><b class="g">Сборка XNU на Linux без macOS</b> — LLVM 18.1.8 + theos cctools (ld64) + macOS 13.3 SDK. Собирает <code>kernel.development.tegu</code> (Mach-O arm64 PIE) за ~2 мин.</li>
+<li><b class="g">Загрузка через ABL</b> — arm64 Image-шим (flags=0xa, AVB-footer), спуск <code>EL2 → EL1</code>, вшитый payload <code>KOMOXNU</code>, старт XNU.</li>
+<li><b class="g">Darwin 22.6.0 грузится</b> — ранний arm_init, MMU, kprintf.</li>
+<li><b class="g">Экран</b> — AppleCLCD <code>1344×2992 @ 0xfac00000</code> (адрес из boot_args/DPU).</li>
+<li><b class="g">14 ГБ верхнего банка RAM</b> (0x880000000); окно XNU на чистом 0x98000000.</li>
+<li><b class="g">IOKit / TeguPlatformExpert</b>, AppleKeyStore, Sandbox, AMFI (заглушки).</li>
+<li><b class="g">userspace: init запускается как PID 1</b> — рабочий пользовательский режим Darwin на Pixel.</li>
+<li>payload вшит в образ ядра (не зависит от ramdisk ABL); chained fixups (PIE) разрешены.</li>
+</ul>
+
+<h2 class="blk"><span class="dot"></span>Главный блокер: UFS (встроенная память)</h2>
+<div class="card">
+Хост <b>Samsung Exynos UFS (UFSHCI 3.0)</b>. При передаче управления ABL <b class="r">усыпляет UniPro-линк</b> / оставляет в фатальном состоянии:
+<ul>
+<li>на handoff: <code>HCS</code> DP=1 (устройство на месте), <code>PA_PWRMode</code> 0x11 (HS, 2 линии), но <b class="r">DME_PEER_GET (устройство) FAIL (res 0xa)</b>;</li>
+<li><code>UPMCRS = 5</code> (PWR_FATAL_ERROR); transfer-реквесты висят вечно (OCS 0xf).</li>
+</ul>
+</div>
+<p><b>Исключено (проверено):</b> <span class="small">DMA/S2MPU-фенсинг, MCQ, auto-hibernate (AHIT=0), ACG/клоки (CLKSTOP=0), UTRLCLR, FMP (UFSPR_SECURE), CMU-клок, голый DME_HIBER_EXIT (→ UPMCRS=5).</span></p>
+<p><b>Портирована</b> вендорная последовательность выхода из H8 из mainline Linux (<code>ufs-exynos.c</code> + <code>phy-gs101-ufs.c</code>): <code>phy_notify_state(HIBERN8_EXIT)</code> = PMA-записи <code>tensor_gs101_pre_h8_exit</code> + CDR-lock перед UIC-командой. <b class="y">Пока не помогло</b> — и обнаружено, что <b class="y">записи в PMA не применяются</b> (чтение идёт, запись не остаётся).</p>
+
+<h2 class="info"><span class="dot"></span>Открытый вопрос для контрибьюторов</h2>
+<div class="card small">
+Почему записи в PMA (<code>0x13204000</code>) не стикаются?
+<ul>
+<li>APB-клок PHY включён (чтения идут). Изоляция PHY в PMU (<code>0x15463EC0</code>, bit0) <b>из EL1 недоступна</b> — прямой доступ даёт SError (TrustZone); ABL её уже снял.</li>
+<li>Гипотезы: нужен PHY-ref-clock / спец-enable для латча записей; либо путь через secure monitor (SMC); либо реальный способ — <b>полный HCE-reset + холодная калибровка PMA (gs101 CFG_PRE_INIT, ~60 записей) + DME_LINKSTARTUP + смена pwr-mode</b> вместо выхода из H8.</li>
+</ul>
+</div>
+
+<h2 class="info"><span class="dot"></span>Карта UFS-регистров komodo (DT + Linux)</h2>
+<pre>ufs@13200000:  hci 0x13200000/0x200 | vs_hci 0x13201100/0x2000
+               unipro 0x13280000/0x8000 | ufsp 0x132a0000/0xa014
+               phy-pma 0x13204000/0x4000 (real 0x3000)  (+0x13208000/0x804)
+sysreg_ufs 0x13020000 (iocc off 0x710, mask 3 val 3)
+PMU (gs101) 0x15460000 ; ufs-phy-iso off 0x3ec0 bit0 (secure)
+CAP 0x1383ff1f (32 UTR, 64-bit, auto-H8, crypto) ; VER 0x300 ; HCMID 0x106
+PMA: адресация (index&lt;&lt;2) ; TRSV повторяется каждые 0x200 index/линию</pre>
+
+<h2 class="no"><span class="dot"></span>Чего НЕ будет (честно)</h2>
+<ul>
+<li>Тач / кнопки / USB / Wi-Fi / GPU на komodo <b>выключены</b> — у tegu они Qualcomm (SM7150), у нас Tensor/Exynos: нужны свои драйверы (Synaptics S3908TG по SPI Samsung USI, dwc3, Mali GPU, Broadcom Wi-Fi, PMIC S2MPG14 через ACPM). Для Tensor их никто не портировал.</li>
+<li>Полноценный iOS-UI (SpringBoard, аппы, анимации) как на <b>Poco X5 Pro</b> — там Snapdragon и драйверы уже написаны автором. Для Pixel это месяцы-годы. Реалистичный обозримый максимум — загрузка ядра + возможно лого, без рабочего ввода/сети.</li>
+</ul>
+
+<h2 class="info"><span class="dot"></span>Как собирать и тестировать</h2>
+<pre># 1. ядро (без macOS)
+cd ~/hakios-port/xnu-linux && ./run-build.sh          # или --from 6
+
+# 2. образ UFS-теста (RAM-only)
+~/hakios-port/build-ufs.sh 0x116 xnu-ufsP-phy         # MODE PREFIX
+
+# 3. запуск (телефон в fastboot: Питание+Громкость-вниз)
+~/hakios-port/boot-ufs.sh P                           # P|A|B|C|D|R|RA|I|IC
+# смотреть баннер "UFS VERDICT", фоткать</pre>
+<p class="small mut"><code>ufsmode</code> биты: 0x1 byte-offsets · 0x2 4K PRDT · 0x4 NEXUS · 0x8 exynos-wake · 0x10 ABL-DMA-area · 0x20 FMP · 0x40 iocc-sysreg · 0x80 full-reset+relink · 0x100 PHY h8-exit assist · 0x200 PMU-isolation poke (SError, не включать).</p>
+
+<h2 class="info"><span class="dot"></span>Ключевые файлы</h2>
+<ul class="small">
+<li><code>xnu-linux/.../bsd/dev/tegu_ufs.c</code> — драйвер UFS (вся работа тут)</li>
+<li><code>komodo/ci/tegu_ufs.c.phy-h8-exit.snapshot</code> — актуальная копия</li>
+<li><code>komodo/ci/0082..0092-komodo-*.patch</code> — серия патчей поверх tegu</li>
+<li><code>komodo/shim/</code> — загрузочный шим (EL2→EL1), <code>mkxnuboot.py</code>, <code>komodo-base.dtb</code></li>
+<li>Linux для портирования: <code>drivers/ufs/host/ufs-exynos.c</code>, <code>drivers/phy/samsung/phy-gs101-ufs.c</code>, <code>phy-samsung-ufs.{c,h}</code></li>
+</ul>
+
+<h2 class="info"><span class="dot"></span>Что нужно прямо сейчас</h2>
+<ol class="small">
+<li>Понять, почему PMA (<code>0x13204000</code>) не принимает записи — клок/enable PHY, или нужен SMC/secure путь.</li>
+<li>Либо реализовать полный холодный bring-up (HCE reset + gs101 PMA CFG_PRE_INIT + LINKSTARTUP + pwr-mode) — выход из ABL-hibernate стабильно фаталит.</li>
+<li>Идеально — человек с доступом к Tensor UFS PHY или с downstream-исходником Google <code>ufs-exynos</code> / <code>ufs-cal-if</code> для zumapro.</li>
+</ol>
+
+<footer>
+Статус на 2026-11-02. Всё RAM-only, Android цел. XNU реально грузится до userspace (PID 1) на Pixel 9 Pro XL — упёрлись в драйвер UFS. Детали, адреса регистров и команды — выше.
+</footer>
+</div>
+</body>
+</html>

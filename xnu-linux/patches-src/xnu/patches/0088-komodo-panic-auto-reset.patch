@@ -1,0 +1,44 @@
+komodo: reset the phone 60 s after a panic (boot-arg panicreset=N, 0 = hang)
+
+No PMIC/battery management and the watchdogs are off: a panicked komodo sat
+with the panel lit until the battery died. Keep the panic visible, then PSCI
+SYSTEM_RESET.
+
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1155,9 +1155,35 @@
+ 	__builtin_unreachable();
+ }
+ 
++#if defined(TEGU)
++/*
++ * komodo: there is no PMIC/fuel-gauge driver yet and the shim stops the
++ * hardware watchdogs, so a panicked phone would sit forever with the panel lit
++ * until the battery is flat (seen 2026-11-02). Leave the panic on screen for
++ * panicreset= seconds (default 60, time to photograph it), then PSCI
++ * SYSTEM_RESET. panicreset=0 keeps the old spin-forever behaviour.
++ */
++TUNABLE(uint32_t, komodo_panic_reset_secs, "panicreset", 60);
++#endif
++
+ void
+ panic_spin_forever(void)
+ {
++#if defined(TEGU)
++	if (komodo_panic_reset_secs != 0) {
++		uint64_t frq, start, now;
++		__asm__ volatile ("mrs %0, CNTFRQ_EL0" : "=r"(frq));
++		__asm__ volatile ("isb\n mrs %0, CNTVCT_EL0" : "=r"(start));
++		if (frq == 0) {
++			frq = 24576000;         /* komodo arch timer */
++		}
++		do {
++			__asm__ volatile ("isb\n mrs %0, CNTVCT_EL0" : "=r"(now));
++		} while (now - start < frq * (uint64_t)komodo_panic_reset_secs);
++		register uint64_t x0 __asm__("x0") = 0x84000009ULL;   /* PSCI SYSTEM_RESET */
++		__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
++	}
++#endif
+ 	for (;;) {
+ #if defined(__arm__) || defined(__arm64__)
+ 		/* On arm32, which doesn't have a WFE timeout, this may not return.  But that should be OK on this path. */

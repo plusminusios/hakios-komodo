@@ -1,0 +1,35 @@
+komodo: keep the Qualcomm SM7150 keys/touch/USB drivers off on zumapro
+
+They poke fixed Snapdragon MMIO that does not exist on Tensor G4 (SError/hang).
+Opt back in with boot-arg qcomdrv=1.
+
+--- a/bsd/dev/tegu_ufs.c
++++ b/bsd/dev/tegu_ufs.c
+@@ -656,10 +656,23 @@
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	tegu_log_start();
+ 	tegu_sample_start();
+-	/* Input drivers (HID services in iokit/Kernel/arm/hid/TeguHID.cpp). */
+-	tegu_keys_init();
+-	tegu_touch_init();
+-	tegu_usb_probe();
++	/* Input drivers (HID services in iokit/Kernel/arm/hid/TeguHID.cpp).
++	 * komodo (Pixel 9 Pro XL, Tensor G4): these three drivers program
++	 * Qualcomm SM7150 blocks at fixed physical addresses (SPMI PMIC 0x0c440000,
++	 * GENI SE 0x00a84000 / TLMM 0x03900000 / GCC 0x00100000, DWC3 0x0a600000 +
++	 * QUSB2 0x088e2000). None of those exist on zumapro; touching them would
++	 * SError or hang. They stay off unless booted with qcomdrv=1 (the
++	 * original tegu behaviour). komodo replacements: Synaptics TCM touch on
++	 * USI SPI, dwc3 @ 0x11210000, S2MPG PMIC keys. */
++	int qcomdrv = 0;
++	(void)PE_parse_boot_argn("qcomdrv", &qcomdrv, sizeof(qcomdrv));
++	if (qcomdrv == 1) {
++		tegu_keys_init();
++		tegu_touch_init();
++		tegu_usb_probe();
++	} else {
++		printf("komodo: Qualcomm keys/touch/usb drivers disabled (qcomdrv=1 to force)\n");
++	}
+ 	return 0;
+ }
+ 

@@ -1,0 +1,185 @@
+komodo: early framebuffer console at the runtime address from boot_args
+
+tegu hard-codes the Redmi framebuffer (PA 0xf0000000, 1080x2406, marked
+TEGU-TODO). On Tensor the bootloader framebuffer is CMA at a runtime address;
+the komodo shim reads it from DPP0 and passes it in boot_args->Video. Use that
+for the stage-0 band, the VA=PA bootstrap block, the final alias and the
+console geometry (1344x2992), clipped to the one mapped 32MB block.
+
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -515,10 +515,13 @@
+ 
+ #if defined(TEGU)
+ 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+-	MOV64	x0, (0xf0000000 /* TEGU-TODO: runtime fb address, patch from live FDT at boot */ + 2368 * 4320)
++	/* komodo: the framebuffer comes from boot_args->Video, which the shim
++	 * fills from the DPU (DPP0 RDMA base). Band at the top-left corner. */
++	ldr		x0, [x20, #40]				// Video.v_baseAddr (PA)
++	ldr		x4, [x20, #56]				// Video.v_rowBytes
++	cbz		x0, Ltegu_mark_done			// no framebuffer: skip
+ 	mov		w1, #-1
+ 	mov		x2, #32
+-	mov		x4, #4320
+ Ltegu_mark_row:
+ 	mov		x3, #64
+ 	mov		x5, x0
+@@ -529,6 +532,7 @@
+ 	add		x0, x0, x4
+ 	subs	x2, x2, #1
+ 	b.ne	Ltegu_mark_row
++Ltegu_mark_done:
+ 	dsb		sy
+ #endif
+ 
+@@ -686,7 +690,9 @@
+ 	 * TEGU uses 16K pages and all bring-up RAM is below 4GB, so the first
+ 	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
+ 	 */
+-	MOV64	x10, 0xf0000000 /* TEGU-TODO: runtime fb address, patch from live FDT at boot */
++	ldr		x10, [x20, #40]				// komodo: Video.v_baseAddr
++	lsr		x10, x10, #(ARM_TT_L2_SHIFT)		// round down to the
++	lsl		x10, x10, #(ARM_TT_L2_SHIFT)		// containing 32MB block
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -347,6 +347,11 @@
+ 	DTEntry chosen = NULL;
+ 	unsigned int dt_entry_size = 0;
+ 
++#if defined(TEGU)
++	/* komodo: framebuffer address/geometry from boot_args (shim, DPP0). */
++	tegu_early_set_fb(args->Video.v_baseAddr, args->Video.v_rowBytes,
++	    args->Video.v_width, args->Video.v_height);
++#endif
+ 	tegu_early_mark(1, "arm_init entered (MMU on)");
+ 
+ 	arm_setup_pre_sign();
+--- a/osfmk/arm64/tegu_early.c
++++ b/osfmk/arm64/tegu_early.c
+@@ -11,12 +11,23 @@
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+ 
+-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0xf0000000 /* TEGU-TODO: runtime fb address, patch from live FDT at boot */;
++/*
++ * komodo: the framebuffer is not at a fixed address on Tensor (CMA, chosen by
++ * the bootloader at runtime). tegu_early_set_fb() takes it from boot_args->
++ * Video (the shim reads it from the DPU). Until then the console is off.
++ * Only one 32MB block is mapped (start.s / arm_vm_init), so the usable height
++ * is clipped to what fits in that block: a write past it would fault inside
++ * the panic path.
++ */
++#define EARLY_BLOCK_SIZE (1ull << 25)   /* ARM_16K_TT_L2_SIZE */
++static volatile uint32_t *early_fb;
++static uint64_t early_fb_pa;
++static unsigned int early_width = 1344u, early_height = 2992u, early_stride = 1344u;
+ #define EARLY_FB early_fb
+-#define EARLY_WIDTH 1080u
+-#define EARLY_HEIGHT 2406u
+-#define EARLY_STRIDE (4320u / 4)
+-#define EARLY_SCALE 2u
++#define EARLY_WIDTH early_width
++#define EARLY_HEIGHT early_height
++#define EARLY_STRIDE early_stride
++#define EARLY_SCALE 3u                  /* 24x48 cells: legible on a phone photo */
+ #define EARLY_CELL_W (8u * EARLY_SCALE)
+ #define EARLY_CELL_H (16u * EARLY_SCALE)
+ #define EARLY_ROWS ((EARLY_HEIGHT - 32u) / EARLY_CELL_H)
+@@ -40,9 +51,40 @@
+ }
+ 
+ void
++tegu_early_set_fb(uint64_t pa, uint64_t row_bytes, uint64_t width, uint64_t height)
++{
++	if (pa == 0 || row_bytes < 4 || width == 0 || height < 64) {
++		return;
++	}
++	uint64_t room = EARLY_BLOCK_SIZE - (pa & (EARLY_BLOCK_SIZE - 1));
++	if (height > room / row_bytes) {
++		height = room / row_bytes;
++	}
++	if (width > row_bytes / 4) {
++		width = row_bytes / 4;
++	}
++	if (height < 64) {
++		return;
++	}
++	early_fb_pa = pa;
++	early_stride = (unsigned int)(row_bytes / 4);
++	early_width = (unsigned int)width;
++	early_height = (unsigned int)height;
++	/* start.s maps the containing block VA=PA until arm_vm_init relocates. */
++	early_fb = (volatile uint32_t *)(uintptr_t)pa;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++uint64_t
++tegu_early_fb_pa(void)
++{
++	return early_fb_pa;
++}
++
++void
+ tegu_early_putc(char c)
+ {
+-	if (early_disabled) {
++	if (early_disabled || !early_fb) {
+ 		return;
+ 	}
+ 	if (!early_started) {
+@@ -89,7 +131,7 @@
+ void
+ tegu_early_mark(unsigned int stage, const char *label)
+ {
+-	if (early_disabled || stage > 20) {
++	if (early_disabled || !early_fb || stage > 20) {
+ 		return;
+ 	}
+ 	uint32_t color = 0xff00ff00u | ((stage & 7u) * 32u << 16);
+@@ -129,7 +171,10 @@
+ tegu_early_relocate(uint64_t base)
+ {
+ 	tegu_early_mark(8, "leaving bootstrap TTBR0");
+-	early_fb = (volatile uint32_t *)(uintptr_t)base;
++	if (early_fb) {
++		early_fb = (volatile uint32_t *)(uintptr_t)
++		    (base + (early_fb_pa & (EARLY_BLOCK_SIZE - 1)));
++	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	tegu_early_mark(9, "kernel framebuffer VA live");
+ }
+--- a/osfmk/arm64/tegu_early.h
++++ b/osfmk/arm64/tegu_early.h
+@@ -11,6 +11,8 @@
+ void tegu_early_putc(char c);
+ void tegu_early_panic(const char *fmt, va_list *args);
+ void tegu_early_relocate(uint64_t base);
++void tegu_early_set_fb(uint64_t pa, uint64_t row_bytes, uint64_t width, uint64_t height);
++uint64_t tegu_early_fb_pa(void);
+ void tegu_early_disable(void);
+ #else
+ static inline void tegu_early_mark(unsigned int stage, const char *label)
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1837,13 +1837,17 @@
+ tegu_early_map_final(void)
+ {
+ 	const vm_map_address_t va = TEGU_EARLY_FB_VA;
++	const uint64_t fb_pa = tegu_early_fb_pa();
++	if (fb_pa == 0) {
++		return;         /* komodo: no framebuffer handed over */
++	}
+ 	assert(va + ARM_TT_L2_SIZE <= gVirtBase);
+ 	tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
+ 	assert((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+ 	assert(*slot == ARM_TTE_EMPTY);
+-	*slot = 0xf0000000ULL /* TEGU-TODO: runtime fb address, from the live FDT at boot */ | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	*slot = (fb_pa & ~(uint64_t)ARM_TT_L2_OFFMASK) | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+ 	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+ 	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+ 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;

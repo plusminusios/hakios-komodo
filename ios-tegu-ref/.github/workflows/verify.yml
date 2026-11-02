@@ -1,0 +1,61 @@
+name: verify
+
+# Fast, free patch-chain verification on Linux before any macOS build minutes
+# are spent: fetches xnu-8796.141.3 (the macOS 13.5 sources dxb builds), runs
+# the stage scripts, and applies all 81 patches in order. Nothing is compiled;
+# this only proves the series applies cleanly, as dxb (xnu.yml) will apply it.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "xnu/patches/**"
+      - ".github/workflows/verify.yml"
+  pull_request:
+    paths:
+      - "xnu/patches/**"
+      - ".github/workflows/verify.yml"
+  workflow_dispatch:
+
+jobs:
+  patches:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch xnu-8796.141.3
+        run: |
+          curl -sL -o xnu.tar.gz \
+            https://github.com/apple-oss-distributions/xnu/archive/refs/tags/xnu-8796.141.3.tar.gz
+          mkdir xnu-src && tar xzf xnu.tar.gz -C xnu-src --strip-components=1
+
+      - name: "Stage pinned sources (as dxb does: *.sh before *.patch)"
+        working-directory: xnu-src
+        run: |
+          export MACHINE_CONFIG=TEGU MACOS_VERSION=13.5
+          for s in ../xnu/patches/*.sh; do
+            bash "$s" || echo "note: $(basename "$s") exited nonzero (xcrun/SDK step is macOS-only)"
+          done
+          test -d bsd/tegu_hfs/core
+          test -d bsd/pthread/tegu_libpthread
+          test -d libkern/crypto/tegu_bearssl
+          echo "staged: tegu_hfs, tegu_libpthread, tegu_bearssl"
+
+      - name: Apply the patch series
+        working-directory: xnu-src
+        run: |
+          n=0
+          for p in ../xnu/patches/*.patch; do
+            if ! patch -p1 -s --fuzz=0 < "$p"; then
+              echo "::error::$(basename "$p") failed to apply"
+              exit 1
+            fi
+            n=$((n+1))
+          done
+          echo "all $n patches applied cleanly with --fuzz=0"
+
+      - name: Sanity-check the tegu additions
+        working-directory: xnu-src
+        run: |
+          # a few files the series must have produced (confirms key patches)
+          test -f iokit/Kernel/arm/TeguFramebuffer.cpp
+          grep -rl "TEGU_FB_DOT_PITCH" iokit | head -1

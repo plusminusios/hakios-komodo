@@ -1,0 +1,116 @@
+komodo: wake the Exynos UFS host ABL leaves clock-gated (ungate + DME_HIBERNATE_EXIT)
+
+Read-only probe 2026-11-02: HCI_MISC 0xde0 (CLK_CTRL_EN set = clocks gated), every
+TUR stuck in the doorbell with OCS 0xf and IS 0. Linux wakes this host with
+exynos_ufs_pre_hibern8(): ungate clocks, then UIC DME_HIBERNATE_EXIT. ufsmode bit3.
+
+--- a/bsd/dev/tegu_ufs.c
++++ b/bsd/dev/tegu_ufs.c
+@@ -152,7 +152,20 @@
+ #define VS_RXPRDT_ENTRY_SIZE    0x04
+ #define VS_UTRL_NEXUS_TYPE      0x40
+ #define VS_DATA_REORDER         0x60
+-#define VS_MISC                 0xb4
++#define VS_CLKSTOP_CTRL         0xb0            /* bits 0-4: clock stop */
++#define VS_MISC                 0xb4            /* bits 5-7: CLK_CTRL_EN */
++#define VS_CLK_STOP_MASK        0x1fu
++#define VS_CLK_CTRL_EN_MASK     0xe0u
++
++/* UFSHCI UIC command interface */
++#define REG_UICCMD              0x90
++#define REG_UICARG1             0x94
++#define REG_UICARG2             0x98
++#define REG_UICARG3             0x9c
++#define HCS_UCRDY               (1u << 3)
++#define IS_UHXS                 (1u << 5)       /* hibernate exit status */
++#define IS_UCCS                 (1u << 10)      /* UIC command completion */
++#define UIC_DME_HIBER_EXIT      0x18
+ #define VS_IOP_ACG_DISABLE      0x100
+ 
+ static inline uint32_t
+@@ -169,6 +182,54 @@
+ 	}
+ }
+ 
++/* Busy-wait (boot path, polled) until (reg & mask) or timeout_us. */
++static bool
++ufs_wait_bits(uint32_t reg, uint32_t mask, unsigned timeout_us)
++{
++	for (unsigned t = 0; t < timeout_us; t += 10) {
++		if (ufs_rd(reg) & mask) {
++			return true;
++		}
++		delay(10);
++	}
++	return (ufs_rd(reg) & mask) != 0;
++}
++
++/*
++ * komodo: ABL hands the Exynos UFS host over clock-gated (HCI_MISC had the
++ * CLK_CTRL_EN bits set, 0xde0) and, as Linux does before gating, most likely
++ * with the link in Hibern8. Commands then stay in the doorbell with OCS 0xf.
++ * Wake it like Linux's exynos_ufs_pre_hibern8(): ungate, then DME_HIBERNATE_EXIT.
++ * Link/clock operations only; nothing is read from or written to the medium.
++ */
++static void
++ufs_exynos_wake(void)
++{
++	uint32_t stop = vs_rd(VS_CLKSTOP_CTRL), misc = vs_rd(VS_MISC);
++	printf("TEGU UFS: wake: CLKSTOP 0x%x MISC 0x%x IS 0x%x HCS 0x%x\n",
++	    stop, misc, ufs_rd(REG_IS), ufs_rd(REG_HCS));
++	vs_wr(VS_CLKSTOP_CTRL, stop & ~VS_CLK_STOP_MASK);
++	vs_wr(VS_MISC, misc & ~VS_CLK_CTRL_EN_MASK);
++	__builtin_arm_dsb(0xf);
++	delay(100);
++	if (!ufs_wait_bits(REG_HCS, HCS_UCRDY, 100000)) {
++		printf("TEGU UFS: wake: UIC not ready (HCS 0x%x)\n", ufs_rd(REG_HCS));
++		return;
++	}
++	ufs_wr(REG_IS, IS_UCCS | IS_UHXS);
++	ufs_wr(REG_UICARG1, 0);
++	ufs_wr(REG_UICARG2, 0);
++	ufs_wr(REG_UICARG3, 0);
++	ufs_wr(REG_UICCMD, UIC_DME_HIBER_EXIT);
++	bool done = ufs_wait_bits(REG_IS, IS_UCCS, 500000);
++	bool hx = ufs_wait_bits(REG_IS, IS_UHXS, 500000);
++	printf("TEGU UFS: wake: HIBER_EXIT %s, exit status %s, ARG2 0x%x IS 0x%x HCS 0x%x (UPMCRS %u)\n",
++	    done ? "completed" : "NO completion", hx ? "seen" : "not seen",
++	    ufs_rd(REG_UICARG2), ufs_rd(REG_IS), ufs_rd(REG_HCS), (ufs_rd(REG_HCS) >> 8) & 7);
++	ufs_wr(REG_IS, ufs_rd(REG_IS));
++	printf("TEGU UFS: wake: now CLKSTOP 0x%x MISC 0x%x\n", vs_rd(VS_CLKSTOP_CTRL), vs_rd(VS_MISC));
++}
++
+ static void
+ ufs_dump_regs(const char *why)
+ {
+@@ -177,9 +238,9 @@
+ 	    ufs_rd(REG_UTRLRSR), ufs_rd(REG_UTRLBAU), ufs_rd(REG_UTRLBA));
+ 	printf("TEGU UFS:   UIC err PA 0x%x DL 0x%x N 0x%x T 0x%x DME 0x%x\n",
+ 	    ufs_rd(0x38), ufs_rd(0x3c), ufs_rd(0x40), ufs_rd(0x44), ufs_rd(0x48));
+-	printf("TEGU UFS:   vs TXPRDT 0x%x RXPRDT 0x%x NEXUS 0x%x REORDER 0x%x MISC 0x%x ACG 0x%x\n",
++	printf("TEGU UFS:   vs TXPRDT 0x%x RXPRDT 0x%x NEXUS 0x%x REORDER 0x%x CLKSTOP 0x%x MISC 0x%x ACG 0x%x\n",
+ 	    vs_rd(VS_TXPRDT_ENTRY_SIZE), vs_rd(VS_RXPRDT_ENTRY_SIZE), vs_rd(VS_UTRL_NEXUS_TYPE),
+-	    vs_rd(VS_DATA_REORDER), vs_rd(VS_MISC), vs_rd(VS_IOP_ACG_DISABLE));
++	    vs_rd(VS_DATA_REORDER), vs_rd(VS_CLKSTOP_CTRL), vs_rd(VS_MISC), vs_rd(VS_IOP_ACG_DISABLE));
+ }
+ 
+ static void
+@@ -676,7 +737,7 @@
+ 	PE_parse_boot_argn("ufsprdt", &prdt, sizeof(prdt));
+ 	su.exynos = (exynos != 0);
+ 	su.prdt_stride = (prdt == 128) ? 128u : 16u;
+-	uint32_t mode = su.exynos ? 0x6u : 0x0u;
++	uint32_t mode = su.exynos ? 0xeu : 0x0u;   /* + bit3: wake (ungate, hibern8 exit) */
+ 	PE_parse_boot_argn("ufsmode", &mode, sizeof(mode));
+ 	su.mode = mode;
+ 	printf("TEGU UFS: mode 0x%x (%s offsets, %s PRDT entries%s), entry %u bytes\n", su.mode,
+@@ -701,6 +762,9 @@
+ 	su.secsize = DEV_BSIZE;
+ 
+ 	lck_mtx_lock(&tegu_ufs_lock);
++	if (su.vs && (su.mode & 8)) {
++		ufs_exynos_wake();
++	}
+ 	error = ufs_take_over_host();
+ 	if (!error) {
+ 		ufs_dump_regs("taken over");

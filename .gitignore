@@ -1,0 +1,18 @@
+# build artifacts / large binaries (rebuildable)
+*.img
+*.bin
+*.o
+*.elf
+*.unstripped
+Image
+payload.bin
+out/
+BUILD/
+logs/
+__pycache__/
+*.pyc
+# downloaded toolchains / SDK / full source trees (fetch via run-build.sh)
+xnu-linux/dl/
+xnu-linux/deps/
+xnu-linux/theos/
+xnu-linux/xnu-src/

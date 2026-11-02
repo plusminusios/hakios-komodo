@@ -1,0 +1,54 @@
+name: komodo-xnu-linux
+# Build the komodo (Pixel 9 Pro XL) XNU kernel on an Ubuntu runner: NO macOS.
+# Same script as a local build (komodo/linux-build/run-build.sh): LLVM 18 +
+# theos cctools ld64 + macOS 13.3 SDK headers, xnu-8796.141.3 + the 81 ios-tegu
+# patches + komodo/ci/008x, then the shim boot images with the payload embedded.
+#
+# Use: in a fork of LeR33/ios-tegu that also has the komodo/ directory, put this
+# file in .github/workflows/ and run "komodo-xnu-linux" from the Actions tab.
+# Artifacts: komodo-xnu (kernel + xnu-boot-raw.img + xnu-boot-stocklike.img),
+#            komodo-xnu-logs (every step's log, also on failure).
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: komodo-xnu-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+
+      - name: Host packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential flex bison m4 perl python3 autoconf automake \
+            libtool curl xz-utils git uuid-dev libncurses-dev libxml2 libxml2-dev lz4 file \
+            gcc-aarch64-linux-gnu
+          git config --global core.autocrlf false
+
+      - name: Build kernel + boot images
+        env:
+          TEGU_PATCHES: ${{ github.workspace }}/xnu/patches
+        run: bash komodo/linux-build/run-build.sh
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: komodo-xnu
+          path: komodo/linux-build/out/
+          if-no-files-found: warn
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: komodo-xnu-logs
+          path: komodo/linux-build/logs/
+          if-no-files-found: warn

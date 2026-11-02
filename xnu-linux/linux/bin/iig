@@ -1,0 +1,34 @@
+#!/bin/bash
+# Stand-in for Apple's closed-source iig (the DriverKit interface generator).
+#
+# The build asks iig to turn iokit/DriverKit/<Class>.iig into
+#   --header  iokit/DriverKit/<Class>.h       (the interface the kernel compiles against)
+#   --impl    iokit/DriverKit/<Class>.iig.cpp (the RPC marshalling linked into the kernel)
+# The headers are exactly what iig would emit for the xnu-8796 family and ship pre-generated in
+# the macOS 13.3 SDK's Kernel.framework. The implementations are not in any SDK: they are
+# generated as stubs by linux/gen-iig-stubs.py from the linker's own undefined-symbol list and
+# dropped in as <Class>.iig.cpp. Until that has run every implementation is an empty
+# translation unit, so the link names what is missing instead of the build inventing symbols.
+set -euo pipefail
+TOPDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+DEPS=${DEPS:-$TOPDIR/deps}
+SDKH="$DEPS/MacOSX13.3.sdk/System/Library/Frameworks/Kernel.framework/Headers"
+def=""; hdr=""; impl=""
+while [ $# -gt 0 ]; do case "$1" in
+  --def) def="$2"; shift 2;;
+  --header) hdr="$2"; shift 2;;
+  --impl) impl="$2"; shift 2;;
+  --framework-name) shift 2;;
+  --) shift; break;;
+  *) shift;;
+esac; done
+[ -n "$def" ] && [ -n "$hdr" ] && [ -n "$impl" ] || { echo "iig shim: --def/--header/--impl required" >&2; exit 1; }
+name=$(basename "$def" .iig)
+src=$(find "$SDKH" -name "$name.h" -path '*DriverKit*' 2>/dev/null | head -1)
+[ -n "$src" ] || { echo "iig shim: no pre-generated DriverKit header for $name in $SDKH" >&2; exit 1; }
+cp "$src" "$hdr"
+if [ -f "$TOPDIR/linux/iig-impl/$name.iig.cpp" ]; then
+  cp "$TOPDIR/linux/iig-impl/$name.iig.cpp" "$impl"
+else
+  echo "/* $name: no implementation generated (iig shim) */" > "$impl"
+fi

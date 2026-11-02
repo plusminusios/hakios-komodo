@@ -1,0 +1,22 @@
+komodo: seed VPIDR_EL2/VMPIDR_EL2 on the EL2 secondary-CPU path
+
+EL1 reads of MPIDR_EL1 return VMPIDR_EL2 when EL2 is implemented; after a
+PSCI CPU_ON at EL2 it is UNKNOWN, so CPU topology/cpu-data lookup by MPIDR
+breaks. The komodo shim does the same for the boot CPU (xnu_enter).
+
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -303,6 +303,13 @@
+ 	msr		VTTBR_EL2, xzr
+ 	msr		CPTR_EL2, xzr
+ 	msr		MDCR_EL2, xzr
++	/* komodo: with EL2 present, EL1 reads of MIDR/MPIDR return VPIDR_EL2/
++	 * VMPIDR_EL2, which are UNKNOWN after a PSCI CPU_ON at EL2. Seed them
++	 * with this core's real IDs or every core reports the same MPIDR. */
++	mrs		x1, MIDR_EL1
++	msr		VPIDR_EL2, x1
++	mrs		x1, MPIDR_EL1
++	msr		VMPIDR_EL2, x1
+ 	mov		x1, #3
+ 	msr		CNTHCTL_EL2, x1
+ 	msr		CNTVOFF_EL2, xzr

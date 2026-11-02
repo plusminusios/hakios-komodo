@@ -1,0 +1,1 @@
+# komodo/tegu: patches known not to apply to xnu-8796.141.3 (filled from the first apply run)

@@ -1,0 +1,18 @@
+This repository builds XNU from Apple's open sources. XNU itself is licensed under the Apple
+Public Source License 2.0; the patches it applies come from myh982516/ios-sweet-umi.
+
+The Linux build plumbing under linux/ is adapted from ls9875/hackios-umi (xnu-deps/ and
+xnu-build.sh) and is distributed under the same terms, APSL 2.0:
+
+  linux/setup-deps.sh       from xnu-deps/setup.sh
+  linux/bin/xcrun           from xnu-deps/host/bin/xcrun
+  linux/bin/xnu-clang       from xnu-deps/host/bin/xnu-clang
+  linux/hostinc/hostcompat.h, xnu_clang_compat.h, copyfile.h, libc.h,
+  linux/hostinc/architecture/, linux/hostinc/mach/   from xnu-deps/hostinc/
+  linux/iig                 from xnu-deps/host/bin/iig
+  linux/gen-iig-stubs.py    from xnu-deps/gen-iig-stubs.py
+
+Changes from that source: the firehose library is the only external library built (this kernel
+compiles its pthread provider in-tree), the board define follows MACHINE_CONFIG, and the iig
+shim's paths are relative to this repository. The original work is by the hackios-umi authors;
+see https://github.com/ls9875/hackios-umi.

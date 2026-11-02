@@ -1,0 +1,3 @@
+#!/bin/sh
+# no-op plutil: plists stay XML, nothing converts anything
+exit 0

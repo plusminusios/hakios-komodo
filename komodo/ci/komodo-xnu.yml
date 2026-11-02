@@ -1,0 +1,128 @@
+name: komodo-xnu
+# Build the XNU kernel (xnu-8796 / iOS 16 era) for the Pixel 9 Pro XL (komodo,
+# Tensor G4 / zumapro). Port of LeR33/ios-tegu's .github/workflows/xnu.yml:
+# komodo reuses the TEGU board-config slot, with the two zumapro corrections in
+# komodo/ci/0082-komodo-board-config.patch (VTIMER_INTID 27, GICR_PE_SIZE
+# 0x40000). Run this in a fork of ios-tegu that also contains this komodo/ dir.
+#
+# Output artifact: kernel.development.tegu  (= the komodo kernel; MACHINE_CONFIG
+# stays TEGU). Feed it to komodo/shim: make bootimg KERNEL=kernel.development.tegu
+
+on:
+  workflow_dispatch:
+    inputs:
+      macos_version:
+        description: macOS release whose xnu to build (13.5 = xnu-8796, iOS 16)
+        default: "13.5"
+      kernel_config:
+        description: RELEASE / DEVELOPMENT / DEBUG
+        default: DEVELOPMENT
+      keep_going:
+        description: make -k (collect all compile errors in one run)
+        default: "false"
+
+concurrency:
+  group: komodo-xnu-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DXB_REPO: https://github.com/blacktop/darwin-xnu-build
+  DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
+  MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
+  KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
+  MACHINE_CONFIG: TEGU          # komodo reuses the TEGU slot (see 0082 patch)
+
+jobs:
+  build:
+    runs-on: macos-14          # Xcode 15.x: iig matches the xnu-8796 IORPC ABI
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch build script
+        run: |
+          git init -q dxb
+          git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
+          git -C dxb checkout -q FETCH_HEAD
+          # the tegu patch series + stage scripts
+          cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
+          # komodo patches 0082..0085 (board config, Qualcomm drivers off,
+          # runtime early framebuffer, secondary VMPIDR) — after tegu's 0081.
+          cp komodo/ci/008*.patch dxb/patches/
+          # libfirehose_kernel is arm64e-only; the kernel is plain arm64
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
+          ls dxb/patches | tail
+
+      - name: Deps
+        run: |
+          brew install jq gum bash cmake ninja
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+          sudo chmod +x /usr/local/bin/xcodes
+          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          xcrun --find iig
+
+      - name: Build
+        working-directory: dxb
+        env:
+          MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
+        run: bash build.sh
+
+      - name: Collect
+        if: always()
+        run: |
+          mkdir -p out
+          cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+          ls -la out
+          (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: komodo-xnu-kernel
+          path: out/
+          if-no-files-found: warn
+
+  payload:
+    # Package the fresh kernel + komodo ADT into the shim boot image that the
+    # hardware session boots (RAM-only: fastboot boot).
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: komodo-xnu-kernel
+          path: k
+      - name: Install aarch64 cross-toolchain
+        run: sudo apt-get update -q && sudo apt-get install -y -q gcc-aarch64-linux-gnu
+      - name: Build komodo shim + payload boot image
+        run: |
+          # komodo ADT is committed (komodo/komodo.adt); regenerate to be safe.
+          python3 komodo/mkadt_komodo.py komodo/komodo.adt
+          # kernel.development.tegu is the komodo kernel (TEGU slot).
+          K=$(ls k/kernel.development.* | head -1)
+          echo "kernel: $K"
+          make -C komodo/shim xnuboot KERNEL="$PWD/$K" STOCK_BOOT="$PWD/stock/boot.img"
+          ls -la komodo/shim/xnu-boot-*.img
+      - name: Validate boot image header
+        run: |
+          python3 - <<'EOF'
+          import struct
+          b = open('komodo/shim/xnu-boot-raw.img','rb').read()
+          assert b[:8] == b'ANDROID!', 'bad magic'
+          ks = struct.unpack_from('<I', b, 8)[0]
+          hv = struct.unpack_from('<I', b, 40)[0]
+          assert hv == 4, f'header version {hv}'
+          k = b[4096:4096 + ks]
+          assert k[56:60] == b'ARMd', 'kernel is not an arm64 Image'
+          assert b'KOMOXNU\0' in k, 'payload not embedded in the kernel image'
+          print(f'komodo xnu-boot-raw.img v4 OK: kernel {ks} B with embedded payload')
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: komodo-xnu-boot
+          path: komodo/shim/xnu-boot-*.img
+          if-no-files-found: error

@@ -1,0 +1,1 @@
+NCURSES_TINFO_5.0.19991023 { global: setupterm; tigetnum; set_curterm; del_curterm; local: *; };
